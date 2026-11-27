@@ -30,6 +30,8 @@ pub struct Workload {
     model: String,
     model_revision: Option<String>,
     precision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slo: Option<crate::slo::Budget>,
 }
 
 impl Workload {
@@ -54,6 +56,7 @@ impl Workload {
             model: first.model.clone(),
             model_revision: first.model_revision.clone(),
             precision: first.precision.clone(),
+            slo: config.slo,
         };
         if config.endpoints.len() > 1 && !workload.has_model_metadata() {
             return Err("Set model_revision and precision when benchmarking multiple endpoints.".into());
@@ -68,13 +71,18 @@ impl Workload {
     }
 
     pub fn notes(&self) -> String {
-        format!(
+        let mut notes = format!(
             "{} requests per point, {} warmup requests per point, {} prompts, {} max output tokens. See [run.json](run.json) for the workload and endpoint metadata.",
             self.requests_per_point,
             self.warmup_requests_per_point,
             self.prompt_count,
             self.max_output_tokens,
-        )
+        );
+        if let Some(budget) = self.slo {
+            notes.push(' ');
+            notes.push_str(&budget.label());
+        }
+        notes
     }
 }
 

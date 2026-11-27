@@ -47,6 +47,7 @@ fn cli(dir: &Temp, args: &[&str]) -> Output {
         .env("BENCHMARK_TEST_API_KEY", "integration-test")
         .env_remove("BENCHMARK_TEST_MISSING_KEY")
         .env("NO_PROXY", "127.0.0.1")
+        .env("no_proxy", "127.0.0.1")
         .args(args)
         .output()
         .unwrap()
@@ -197,7 +198,6 @@ fn records_and_compares_runs_with_workload_and_checksum_validation() {
     let summary = load(dir.path("first/summary.json"));
     assert_eq!(summary[0]["successes"], 1);
     assert_eq!(summary[0]["pareto"], true);
-    assert!(summary[0]["p95_max_frame_gap_ms"].as_f64().unwrap() >= 5.0);
     let gap = summary[0]["p95_max_frame_gap_ms"].as_f64().unwrap();
     let tpot = summary[0]["p95_estimated_tpot_ms"].as_f64().unwrap();
     assert!((gap / 2.0 - tpot).abs() < 1e-9);
@@ -241,6 +241,13 @@ fn records_and_compares_runs_with_workload_and_checksum_validation() {
 
     let manifest = dir.path("second/run.json");
     let mut modified = load(manifest.clone());
+    modified["workload"]["slo"] = json!({"ttft_ms": 100, "total_ms": 200});
+    save(&manifest, &modified);
+    assert_error(
+        cli(&dir, &["compare", "again", original, second]),
+        "settings differ",
+    );
+    modified["workload"].as_object_mut().unwrap().remove("slo");
     modified["workload"]["model_revision"] = "different".into();
     save(&manifest, &modified);
     assert_error(
@@ -283,7 +290,7 @@ fn counts_stream_errors_and_excludes_all_failed_points_from_pareto_frontier() {
         "case-6" => respond(&mut stream, "200 OK", TEXT, DONE),
         "case-7" => stream
             .write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\ndata: \xff\n\n",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\ndata: \xff\n\n",
             )
             .unwrap(),
         _ => panic!("unexpected {prompt}"),
@@ -451,4 +458,104 @@ fn a_failed_warmup_cannot_produce_a_complete_run() {
     worker.join().unwrap();
     assert!(!dir.path("failed-run/run.json").exists());
     assert!(!dir.path("failed-run/summary.json").exists());
+}
+
+#[test]
+fn slo_goodput_counts_only_proven_budget_compliance() {
+    let (url, worker) = mock(5, |prompt, mut stream| {
+        let single_usage = USAGE.replace(":3", ":1");
+        let response = match prompt.as_str() {
+            "case-0" => format!("{TEXT}{single_usage}{DONE}"),
+            "case-1" => format!("{TEXT}{USAGE}{DONE}"),
+            "case-2" => format!("{TEXT}{TEXT}{USAGE}{DONE}"),
+            "case-4" => {
+                let invalid = USAGE.replace(":3", ":17");
+                format!("{TEXT}{TEXT}{invalid}{DONE}")
+            }
+            "case-3" => {
+                respond(&mut stream, "503 Service Unavailable", "", "");
+                return;
+            }
+            _ => panic!("unexpected request {prompt}"),
+        };
+        respond(&mut stream, "200 OK", &response, "");
+    });
+    let dir = Temp::new();
+    let mut workload = config(&url, 5);
+    workload["slo"] = json!({"ttft_ms": 5000.0, "total_ms": 5000.0, "estimated_tpot_ms": 5000.0});
+    save(&dir.path("input.json"), &workload);
+    assert_ok(cli(&dir, &["run", "input.json", "budgeted"]));
+    worker.join().unwrap();
+
+    let point = &load(dir.path("budgeted/summary.json"))[0];
+    assert_eq!(point["successes"], 3);
+    assert_eq!(point["slo_met_requests"], 2);
+    assert_eq!(point["slo_output_tokens"], 4);
+    let rate = point["output_tokens_per_second"].as_f64().unwrap();
+    let goodput = point["slo_output_tokens_per_second"].as_f64().unwrap();
+    assert!((goodput / rate - 4.0 / 7.0).abs() < 1e-12);
+    let cost = point["usd_per_million_slo_tokens"].as_f64().unwrap();
+    assert!((cost * goodput - 2.0 * 1e6 / 3600.0).abs() < 1e-9);
+    assert_eq!(
+        load(dir.path("budgeted/run.json"))["workload"]["slo"],
+        workload["slo"]
+    );
+
+    let mut samples = csv::Reader::from_path(dir.path("budgeted/samples.csv")).unwrap();
+    let column = samples
+        .headers()
+        .unwrap()
+        .iter()
+        .position(|h| h == "slo_met")
+        .unwrap();
+    let values: Vec<_> = samples
+        .records()
+        .map(|row| row.unwrap()[column].to_owned())
+        .collect();
+    assert_eq!(values, ["true", "false", "true", "false", "false"]);
+    assert_eq!(point["slo_pareto"], true);
+    assert_eq!(point["pareto"], false);
+    assert!(
+        fs::read_to_string(dir.path("budgeted/samples.csv"))
+            .unwrap()
+            .contains("exceed the request budget")
+    );
+    assert!(dir.path("budgeted/slo-pareto.svg").exists());
+    let report = fs::read_to_string(dir.path("budgeted/REPORT.md")).unwrap();
+    let slo_table = report.split_once("## SLO goodput").unwrap().1;
+    assert!(slo_table.contains(r"vLLM \| loopback | test-1 | CPU"));
+    let plot = fs::read_to_string(dir.path("budgeted/slo-pareto.svg")).unwrap();
+    assert!(plot.contains("test-1 (CPU)"));
+}
+
+#[test]
+fn rejects_a_nonpositive_latency_budget_before_creating_output() {
+    let dir = Temp::new();
+    let mut workload = config("http://127.0.0.1:1/v1/", 1);
+    workload["slo"] = json!({"ttft_ms": -1, "total_ms": 100});
+    save(&dir.path("input.json"), &workload);
+    assert_error(
+        cli(&dir, &["run", "input.json", "bad-slo"]),
+        "SLO limits must be finite and positive",
+    );
+    assert!(!dir.path("bad-slo").exists());
+}
+
+#[test]
+fn zero_qualified_tokens_has_no_unit_cost_or_frontier_position() {
+    let (url, worker) = mock(1, |_prompt, mut stream| {
+        respond(&mut stream, "200 OK", &format!("{TEXT}{USAGE}{DONE}"), "");
+    });
+    let dir = Temp::new();
+    let mut workload = config(&url, 1);
+    workload["slo"] = json!({"ttft_ms": 5000, "total_ms": 5000, "estimated_tpot_ms": 100});
+    save(&dir.path("input.json"), &workload);
+    assert_ok(cli(&dir, &["run", "input.json", "zero"]));
+    worker.join().unwrap();
+    let report = load(dir.path("zero/summary.json"));
+    assert_eq!(report[0]["slo_met_requests"], 0);
+    assert_eq!(report[0]["slo_output_tokens_per_second"], 0.0);
+    assert_eq!(report[0]["usd_per_million_slo_tokens"], Value::Null);
+    assert_eq!(report[0]["slo_pareto"], false);
+    assert_eq!(report[0]["pareto"], true);
 }

@@ -39,6 +39,29 @@ The load generator uses fixed concurrency with no imposed arrival rate. Report f
 
 Engine references: [vLLM serving](https://docs.vllm.ai/en/latest/serving/online_serving/openai_compatible_server/), [SGLang OpenAI APIs](https://docs.sglang.io/docs/basic_usage/openai_api_completions), and [TensorRT-LLM serving](https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve/trtllm-serve.html).
 
+## Measure SLO goodput
+
+Add an optional budget to the benchmark config. Limits are in milliseconds per
+request.
+
+```json
+"slo": {"ttft_ms": 250, "total_ms": 3000, "estimated_tpot_ms": 40}
+```
+
+TTFT and total latency are required. With an estimated TPOT limit, a
+multi-token response needs enough text events to estimate TPOT. Single-token
+responses only need to meet the TTFT and total latency limits.
+
+The sample log records the decision for each request. The summary divides
+qualified output tokens by the entire batch duration, including time spent on
+failed or late requests. It reports request and token counts, goodput, and
+the cost per million qualified tokens. Points with zero qualified tokens have
+zero goodput and no cost per token.
+
+`slo-pareto.svg` shows p95 TTFT across successful requests, goodput, and cost
+per million qualified tokens. Points with positive goodput can appear when
+some requests failed. `compare` requires identical SLO budgets across inputs.
+
 ## Tests
 
 `cargo test --locked` uses loopback HTTP servers and temporary output directories.
@@ -47,7 +70,7 @@ warmups, incomplete responses, and rejection of altered or incompatible
 comparison inputs. It needs no model server or API key.
 
 To rebuild and measure production coverage, install the Rust `llvm-tools-preview`
-component. Set `llvm` to the directory with its `llvm-profdata` and `llvm-cov`
+component and make `jq` available on your PATH. Set `llvm` to the directory with its `llvm-profdata` and `llvm-cov`
 executables, or use a compatible system LLVM.
 
 ```sh
