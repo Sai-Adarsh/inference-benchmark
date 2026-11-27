@@ -11,8 +11,8 @@
   "timeout_seconds": 120,
   "warmup_requests": 4,
   "endpoints": [
-    {"engine":"vLLM","version":"record actual release","hardware":"1x NVIDIA H100 SXM 80 GB","model":"Qwen/Qwen2.5-7B-Instruct","base_url":"http://127.0.0.1:8001/v1","hourly_usd":3.0},
-    {"engine":"SGLang","version":"record actual release","hardware":"1x NVIDIA H100 SXM 80 GB","model":"Qwen/Qwen2.5-7B-Instruct","base_url":"http://127.0.0.1:8002/v1","hourly_usd":3.0},
-    {"engine":"TensorRT-LLM","version":"record actual release","hardware":"1x NVIDIA H100 SXM 80 GB","model":"Qwen/Qwen2.5-7B-Instruct","base_url":"http://127.0.0.1:8003/v1","hourly_usd":3.0}
+    {"engine":"vLLM","version":"record actual release","hardware":"1x NVIDIA H100 SXM 80 GB","model":"Qwen/Qwen2.5-7B-Instruct","model_revision":null,"precision":"bf16","base_url":"http://127.0.0.1:8001/v1","hourly_usd":3.0},
+    {"engine":"SGLang","version":"record actual release","hardware":"1x NVIDIA H100 SXM 80 GB","model":"Qwen/Qwen2.5-7B-Instruct","model_revision":null,"precision":"bf16","base_url":"http://127.0.0.1:8002/v1","hourly_usd":3.0},
+    {"engine":"TensorRT-LLM","version":"record actual release","hardware":"1x NVIDIA H100 SXM 80 GB","model":"Qwen/Qwen2.5-7B-Instruct","model_revision":null,"precision":"bf16","base_url":"http://127.0.0.1:8003/v1","hourly_usd":3.0}
   ]
 }
