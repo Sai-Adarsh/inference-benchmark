@@ -1,14 +1,17 @@
 use crate::{AnyError, Config, Endpoint, Point, SAMPLING_TEMPERATURE};
-use ring::digest::{SHA256, digest};
+use ring::digest::{Context, SHA256, digest};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
+    io::Read,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
+const LEGACY_SCHEMA_VERSION: u32 = 2;
 const FILE_NAME: &str = "run.json";
+const SAMPLES_FILE: &str = "samples.csv";
 
 #[derive(Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -113,16 +116,35 @@ struct Manifest {
     workload: Workload,
     engines: Vec<Engine>,
     summary_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    samples_sha256: Option<String>,
     input_runs: Vec<String>,
 }
 
 fn sha256(bytes: &[u8]) -> String {
+    digest_hex(digest(&SHA256, bytes).as_ref())
+}
+
+fn digest_hex(hash: &[u8]) -> String {
     use std::fmt::Write;
     let mut hex = String::with_capacity(64);
-    for byte in digest(&SHA256, bytes).as_ref() {
+    for byte in hash {
         write!(&mut hex, "{byte:02x}").expect("writing to String");
     }
     hex
+}
+
+fn sha256_file(path: &Path) -> std::io::Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut hash = Context::new(&SHA256);
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(digest_hex(hash.finish().as_ref()));
+        }
+        hash.update(&buffer[..count]);
+    }
 }
 
 pub fn timestamp() -> Result<u64, AnyError> {
@@ -166,6 +188,11 @@ fn write(
     started_unix_seconds: u64,
     input_runs: Vec<String>,
 ) -> Result<(), AnyError> {
+    let samples_sha256 = if kind == Kind::Live {
+        Some(sha256_file(&output.join(SAMPLES_FILE))?)
+    } else {
+        None
+    };
     let manifest = Manifest {
         schema_version: SCHEMA_VERSION,
         kind,
@@ -173,6 +200,7 @@ fn write(
         workload,
         engines,
         summary_sha256: sha256(&fs::read(output.join("summary.json"))?),
+        samples_sha256,
         input_runs,
     };
     fs::write(output.join(FILE_NAME), serde_json::to_vec_pretty(&manifest)?)?;
@@ -198,8 +226,12 @@ impl Comparison {
                 format!("{input}: cannot read adjacent {FILE_NAME}: {error}. Supply summaries from completed live runs.")
             })?;
             let manifest: Manifest = serde_json::from_slice(&raw_manifest)?;
-            if manifest.schema_version != SCHEMA_VERSION || manifest.kind != Kind::Live {
-                return Err(format!("{input}: expected a version {SCHEMA_VERSION} live run.").into());
+            if ![LEGACY_SCHEMA_VERSION, SCHEMA_VERSION].contains(&manifest.schema_version)
+                || manifest.kind != Kind::Live
+            {
+                return Err(format!(
+                    "{input}: expected a version {LEGACY_SCHEMA_VERSION} or {SCHEMA_VERSION} live run."
+                ).into());
             }
             if !manifest.workload.has_model_metadata() {
                 return Err(format!("{input}: set model_revision and precision when recording comparable runs.").into());
@@ -218,6 +250,17 @@ impl Comparison {
             }
             if workload.as_ref().is_some_and(|reference| reference != &manifest.workload) {
                 return Err(format!("{input}: workload or model settings differ from the first run.").into());
+            }
+            if manifest.schema_version == SCHEMA_VERSION {
+                let expected = manifest.samples_sha256.as_deref().ok_or_else(|| {
+                    format!("{input}: live run manifest is missing samples_sha256.")
+                })?;
+                let actual = sha256_file(&path.with_file_name(SAMPLES_FILE)).map_err(|error| {
+                    format!("{input}: cannot read adjacent {SAMPLES_FILE}: {error}.")
+                })?;
+                if actual != expected {
+                    return Err(format!("{input}: samples checksum does not match its run manifest.").into());
+                }
             }
             workload.get_or_insert(manifest.workload);
             points.extend(rows);

@@ -274,6 +274,95 @@ fn records_and_compares_runs_with_workload_and_checksum_validation() {
 }
 
 #[test]
+fn samples_join_to_their_live_summary_point() {
+    let dir = Temp::new();
+    let (url, worker) = mock(8, |_, mut stream| {
+        respond(&mut stream, "200 OK", &format!("{TEXT}{USAGE}{DONE}"), "");
+    });
+    let mut workload = config(&url, 2);
+    workload["concurrency"] = json!([1, 2]);
+    let mut second = workload["endpoints"][0].clone();
+    second["hardware"] = "second host".into();
+    workload["endpoints"].as_array_mut().unwrap().push(second);
+    save(&dir.path("input.json"), &workload);
+    assert_ok(cli(&dir, &["run", "input.json", "indexed"]));
+    worker.join().unwrap();
+
+    let summary = load(dir.path("indexed/summary.json"));
+    let points = summary.as_array().unwrap();
+    assert_eq!(points.len(), 4);
+    let mut csv = csv::Reader::from_path(dir.path("indexed/samples.csv")).unwrap();
+    let headers = csv.headers().unwrap().clone();
+    let column = |name| headers.iter().position(|field| field == name).unwrap_or_else(|| {
+        panic!("samples.csv has no {name} column")
+    });
+    let mut samples_per_point = [0; 4];
+    let mut tokens_per_point = [0; 4];
+    for sample in csv.records() {
+        let sample = sample.unwrap();
+        let point: usize = sample[column("point_index")].parse().unwrap();
+        let request: usize = sample[column("request")].parse().unwrap();
+        let concurrency: u64 = sample[column("concurrency")].parse().unwrap();
+        assert_eq!(request, samples_per_point[point]);
+        assert_eq!(points[point]["concurrency"], concurrency);
+        assert_eq!(points[point]["hardware"], if point < 2 { "CPU" } else { "second host" });
+        samples_per_point[point] += 1;
+        tokens_per_point[point] += sample[column("completion_tokens")].parse::<u64>().unwrap();
+    }
+    assert_eq!(samples_per_point, [2; 4]);
+    for (index, point) in points.iter().enumerate() {
+        let elapsed = point["elapsed_seconds"].as_f64().unwrap();
+        let rate = point["output_tokens_per_second"].as_f64().unwrap();
+        assert!(elapsed > 0.0);
+        assert_eq!(tokens_per_point[index], 6);
+        assert!((elapsed * rate - tokens_per_point[index] as f64).abs() < 1e-9);
+    }
+}
+
+#[test]
+fn comparison_requires_original_samples_for_new_live_runs() {
+    let dir = Temp::new();
+    successful_run(&dir, "source", |_| {});
+    let samples = dir.path("source/samples.csv");
+    let original = fs::read(&samples).unwrap();
+    let mut changed = original.clone();
+    changed.push(b'\n');
+    fs::write(&samples, changed).unwrap();
+    let base_args = ["compare", "compared", "source/summary.json"];
+    assert_error(cli(&dir, &base_args), "samples checksum");
+    assert!(!dir.path("compared").exists());
+    fs::remove_file(&samples).unwrap();
+    assert_error(cli(&dir, &base_args), "cannot read adjacent samples.csv");
+    assert!(!dir.path("compared").exists());
+    fs::write(&samples, original).unwrap();
+
+    let path = dir.path("source/run.json");
+    let manifest = load(path.clone());
+    assert_eq!(manifest["schema_version"], 3);
+    assert_eq!(manifest["samples_sha256"].as_str().unwrap().len(), 64);
+    let mut incomplete = manifest.clone();
+    incomplete.as_object_mut().unwrap().remove("samples_sha256");
+    save(&path, &incomplete);
+    assert_error(cli(&dir, &base_args), "samples_sha256");
+    assert!(!dir.path("compared").exists());
+    save(&path, &manifest);
+    assert_ok(cli(&dir, &base_args));
+}
+
+#[test]
+fn schema_two_runs_still_compare_without_raw_samples() {
+    let dir = Temp::new();
+    successful_run(&dir, "legacy", |_| {});
+    let path = dir.path("legacy/run.json");
+    let mut manifest = load(path.clone());
+    manifest["schema_version"] = 2.into();
+    manifest.as_object_mut().unwrap().remove("samples_sha256");
+    save(&path, &manifest);
+    fs::remove_file(dir.path("legacy/samples.csv")).unwrap();
+    assert_ok(cli(&dir, &["compare", "compared", "legacy/summary.json"]));
+}
+
+#[test]
 fn counts_stream_errors_and_excludes_all_failed_points_from_pareto_frontier() {
     let (url, worker) = mock(8, |prompt, mut stream| match prompt.as_str() {
         "case-0" => respond(&mut stream, "503 Service Unavailable", "", ""),

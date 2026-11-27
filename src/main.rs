@@ -69,6 +69,7 @@ pub struct Point {
     slo_output_tokens_per_second: Option<f64>,
     usd_per_million_slo_tokens: Option<f64>,
     slo_pareto: Option<bool>,
+    elapsed_seconds: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -85,6 +86,7 @@ struct Sample {
     completion_tokens: Option<u64>,
     error: Option<String>,
     slo_met: Option<bool>,
+    point_index: usize,
 }
 
 struct Target<'a> {
@@ -203,7 +205,8 @@ fn percentile95(mut values: Vec<f64>) -> Option<f64> {
     Some(values[(values.len() * 95).div_ceil(100) - 1])
 }
 
-fn measure(client: &Client, target: &Target<'_>, config: &Config, concurrency: usize)
+fn measure(client: &Client, target: &Target<'_>, config: &Config, concurrency: usize,
+           point_index: usize)
     -> Result<(Point, Vec<Sample>), AnyError> {
     for _ in 0..config.warmup_requests {
         stream_chat(client, target, "Reply to this benchmark warmup in one short sentence.",
@@ -244,6 +247,7 @@ fn measure(client: &Client, target: &Target<'_>, config: &Config, concurrency: u
                         completion_tokens: stats.map(|s| s.completion_tokens),
                         error,
                         slo_met: None,
+                        point_index,
                     });
                 }
                 samples
@@ -296,6 +300,7 @@ fn measure(client: &Client, target: &Target<'_>, config: &Config, concurrency: u
         slo_output_tokens_per_second: goodput.map(|(_, _, rate)| rate),
         usd_per_million_slo_tokens: goodput.and_then(|(_, _, rate)| (rate > 0.0).then(|| cost(rate))),
         slo_pareto: None,
+        elapsed_seconds: Some(elapsed),
     };
     Ok((point, samples))
 }
@@ -331,7 +336,7 @@ fn run(config_path: &Path, output: &Path) -> Result<(), AnyError> {
     let mut samples_file = csv::Writer::from_writer(samples);
     for target in &targets {
         for &concurrency in &config.concurrency {
-            let (point, samples) = measure(&client, target, &config, concurrency)?;
+            let (point, samples) = measure(&client, target, &config, concurrency, report.len())?;
             eprintln!("{} @ {} concurrent: {} success, {} failed",
                       point.engine, point.concurrency, point.successes, point.failures);
             for sample in samples {
@@ -341,6 +346,7 @@ fn run(config_path: &Path, output: &Path) -> Result<(), AnyError> {
             report.push(point);
         }
     }
+    drop(samples_file);
     report::write(output, report, false, &workload.notes())?;
     manifest::write_run(output, workload, &config.endpoints, started)
 }
@@ -360,6 +366,7 @@ fn demo(output: &Path) -> Result<(), AnyError> {
         output_tokens_per_second: Some(rate), usd_per_million_output_tokens: Some(cost), pareto: false,
         slo_met_requests: None, slo_output_tokens: None, slo_output_tokens_per_second: None,
         usd_per_million_slo_tokens: None, slo_pareto: None,
+        elapsed_seconds: None,
     }).collect();
     report::write(output, points, true, "Illustrative numbers for checking the report format.")
 }
