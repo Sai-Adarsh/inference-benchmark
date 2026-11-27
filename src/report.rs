@@ -72,14 +72,15 @@ pub fn write(output: &Path, mut points: Vec<Point>, demo: bool, notes: &str) -> 
     markdown.push_str(notes);
     markdown.push_str("\n\n![Latency and cost vs throughput](pareto.svg)\n\n");
     markdown.push_str("Filled markers show the three-objective Pareto frontier. Labels show concurrency. Points with failed requests are excluded from the frontier and plot.\n\n");
-    markdown.push_str("| Engine | Version | Hardware | Model | Concurrent | Success | Failed | P95 TTFT ms | P95 total ms | Output tokens/s | USD/M output tokens | Pareto |\n");
-    markdown.push_str("|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|\n");
+    markdown.push_str("| Engine | Version | Hardware | Model | Concurrent | Success | Failed | P95 TTFT ms | P95 estimated TPOT ms | P95 max frame gap ms | P95 total ms | Output tokens/s | USD/M output tokens | Pareto |\n");
+    markdown.push_str("|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
     let escape = |text: &str| text.replace('|', "\\|").replace(['\n', '\r'], " ");
     for point in &points {
         csv.serialize(point)?;
-        markdown.push_str(&format!("| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+        markdown.push_str(&format!("| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             escape(&point.engine), escape(&point.version), escape(&point.hardware), escape(&point.model),
             point.concurrency, point.successes, point.failures, label(point.p95_ttft_ms),
+            label(point.p95_estimated_tpot_ms), label(point.p95_max_frame_gap_ms),
             label(point.p95_total_ms), label(point.output_tokens_per_second),
             label(point.usd_per_million_output_tokens), if point.pareto { "Yes" } else { "—" }));
     }

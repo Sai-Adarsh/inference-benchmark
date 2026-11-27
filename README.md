@@ -28,7 +28,9 @@ Keep each summary next to its manifest. `compare` requires matching prompt order
 
 ## Metrics
 
-- **TTFT** is the time from sending the request to the first stream frame with generated or reasoning text. A successful response reports `usage.completion_tokens` and ends with `[DONE]`.
+- **TTFT** is the time from sending the request to the first complete event with generated or reasoning text. The client supports SSE comments, CRLF, and multiline data. A successful response reports `usage.completion_tokens` and ends with a complete `[DONE]` event. Lines and event data are capped at 1 MiB.
+- **Estimated TPOT** divides the time between the first and last text events by completion tokens minus one. It requires at least two text events and two completion tokens. Frames may contain several tokens, so this is a client estimate of time per output token.
+- **Max frame gap** is the longest interval between adjacent events with text in one request. The summary reports the p95 of that per-request value. It measures delivery stalls, including buffering outside the model process.
 - **Throughput** is successful output tokens divided by the batch's wall time.
 - **Cost per million output tokens** is total hourly deployment cost divided by millions of output tokens per hour.
 - **Pareto frontier** includes fully successful points for which no other fully successful point is at least as good on all three objectives and better on at least one. The objectives are lower p95 TTFT, higher throughput, and lower cost.
@@ -36,3 +38,29 @@ Keep each summary next to its manifest. `compare` requires matching prompt order
 The load generator uses fixed concurrency with no imposed arrival rate. Report failed requests and repeat the sweep at least three times for a public comparison.
 
 Engine references: [vLLM serving](https://docs.vllm.ai/en/latest/serving/online_serving/openai_compatible_server/), [SGLang OpenAI APIs](https://docs.sglang.io/docs/basic_usage/openai_api_completions), and [TensorRT-LLM serving](https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve/trtllm-serve.html).
+
+## Tests
+
+`cargo test --locked` uses loopback HTTP servers and temporary output directories.
+The suite checks request framing and concurrency, SSE text and usage, failed
+warmups, incomplete responses, and rejection of altered or incompatible
+comparison inputs. It needs no model server or API key.
+
+To rebuild and measure production coverage, install the Rust `llvm-tools-preview`
+component. Set `llvm` to the directory with its `llvm-profdata` and `llvm-cov`
+executables, or use a compatible system LLVM.
+
+```sh
+set -eu
+run="$(mktemp -d)"
+mkdir "$run/profiles"
+export CARGO_TARGET_DIR="$run/target"
+export RUSTFLAGS="-C instrument-coverage"
+export LLVM_PROFILE_FILE="$run/profiles/%p-%m.profraw"
+cargo test --locked --message-format=json > "$run/cargo.json"
+sse_test="$(jq -Rr 'fromjson? | select(.reason == "compiler-artifact"
+   and .target.kind == ["test"] and .target.name == "sse") | .executable' "$run/cargo.json")"
+"$llvm/llvm-profdata" merge -sparse "$run"/profiles/*.profraw -o "$run/run.profdata"
+"$llvm/llvm-cov" report "$CARGO_TARGET_DIR/debug/inference-benchmark" \
+  -object "$sse_test" -instr-profile "$run/run.profdata" "$PWD/src"
+```

@@ -1,12 +1,13 @@
 mod manifest;
 mod report;
+mod sse;
 
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     env, fs,
-    io::{BufRead, BufReader},
+    io::{self, BufReader},
     path::Path,
     sync::{Barrier, atomic::{AtomicUsize, Ordering}},
     thread,
@@ -55,6 +56,8 @@ pub struct Point {
     successes: usize,
     failures: usize,
     p95_ttft_ms: Option<f64>,
+    p95_estimated_tpot_ms: Option<f64>,
+    p95_max_frame_gap_ms: Option<f64>,
     p95_total_ms: Option<f64>,
     output_tokens_per_second: Option<f64>,
     usd_per_million_output_tokens: Option<f64>,
@@ -68,6 +71,9 @@ struct Sample {
     request: usize,
     prompt_index: usize,
     ttft_ms: Option<f64>,
+    estimated_tpot_ms: Option<f64>,
+    max_frame_gap_ms: Option<f64>,
+    text_frames: usize,
     total_ms: f64,
     completion_tokens: Option<u64>,
     error: Option<String>,
@@ -91,8 +97,16 @@ impl<'a> Target<'a> {
     }
 }
 
+struct StreamStats {
+    ttft_ms: f64,
+    estimated_tpot_ms: Option<f64>,
+    max_frame_gap_ms: Option<f64>,
+    text_frames: usize,
+    completion_tokens: u64,
+}
+
 fn stream_chat(client: &Client, target: &Target<'_>, prompt: &str, max_tokens: usize,
-               start: Instant) -> Result<(f64, u64), String> {
+               start: Instant) -> Result<StreamStats, String> {
     let mut request = client.post(target.url.clone()).json(&json!({
         "model": target.endpoint.model,
         "messages": [{"role": "user", "content": prompt}],
@@ -110,12 +124,24 @@ fn stream_chat(client: &Client, target: &Target<'_>, prompt: &str, max_tokens: u
     if !response.status().is_success() {
         return Err(format!("HTTP {}", response.status().as_u16()));
     }
-    let mut first_token = None;
-    let mut generated_tokens = None;
+    let mut first_text_ms = None;
+    let mut last_text_ms = None;
+    let mut max_frame_gap_ms: Option<f64> = None;
+    let mut text_frames = 0;
+    let mut completion_tokens = None;
     let mut done = false;
-    for line in BufReader::new(response).lines() {
-        let line = line.map_err(|_| "Stream read failed")?;
-        let Some(data) = line.strip_prefix("data:").map(str::trim) else { continue };
+    let mut events = sse::Events::new(BufReader::new(response));
+    while let Some(frame) = events.next().map_err(|error| match error.kind() {
+        io::ErrorKind::InvalidData => format!("Invalid stream: {error}"),
+        _ => "Stream read failed".to_string(),
+    })? {
+        if frame.kind == "error" {
+            return Err("Upstream returned an error event".into());
+        }
+        let data = frame.data.trim();
+        if data.is_empty() || frame.kind == "ping" {
+            continue;
+        }
         if data == "[DONE]" {
             done = true;
             break;
@@ -124,25 +150,35 @@ fn stream_chat(client: &Client, target: &Target<'_>, prompt: &str, max_tokens: u
         if event.get("error").is_some_and(|v| !v.is_null()) {
             return Err("Upstream returned an error frame".into());
         }
-        if first_token.is_none() {
-            let delta = &event["choices"][0]["delta"];
-            if ["content", "reasoning_content", "reasoning"].iter().any(|key| {
-                delta[*key].as_str().is_some_and(|text| !text.is_empty())
-            }) {
-                first_token = Some(start.elapsed().as_secs_f64() * 1_000.0);
+        let delta = &event["choices"][0]["delta"];
+        if ["content", "reasoning_content", "reasoning"].iter().any(|key| {
+            delta[*key].as_str().is_some_and(|text| !text.is_empty())
+        }) {
+            let now_ms = start.elapsed().as_secs_f64() * 1_000.0;
+            first_text_ms.get_or_insert(now_ms);
+            if let Some(previous) = last_text_ms {
+                let gap = now_ms - previous;
+                max_frame_gap_ms = Some(max_frame_gap_ms.unwrap_or(0.0).max(gap));
             }
+            last_text_ms = Some(now_ms);
+            text_frames += 1;
         }
         if let Some(tokens) = event["usage"]["completion_tokens"].as_u64() {
-            generated_tokens = Some(tokens);
+            completion_tokens = Some(tokens);
         }
     }
     if !done {
         return Err("Stream ended before [DONE]".into());
     }
-    Ok((
-        first_token.ok_or("No generated text in stream")?,
-        generated_tokens.filter(|&tokens| tokens > 0).ok_or("Missing positive usage.completion_tokens")?,
-    ))
+    let ttft_ms = first_text_ms.ok_or("No generated text in stream")?;
+    let completion_tokens = completion_tokens.filter(|&tokens| tokens > 0)
+        .ok_or("Missing positive usage.completion_tokens")?;
+    let estimated_tpot_ms = if text_frames >= 2 && completion_tokens > 1 {
+        last_text_ms.map(|last| (last - ttft_ms) / (completion_tokens - 1) as f64)
+    } else {
+        None
+    };
+    Ok(StreamStats { ttft_ms, estimated_tpot_ms, max_frame_gap_ms, text_frames, completion_tokens })
 }
 
 fn percentile95(mut values: Vec<f64>) -> Option<f64> {
@@ -177,18 +213,21 @@ fn measure(client: &Client, target: &Target<'_>, config: &Config, concurrency: u
                     let prompt_index = request % config.prompts.len();
                     let start = Instant::now();
                     let result = stream_chat(client, target, &config.prompts[prompt_index], config.max_tokens, start);
-                    let (ttft_ms, completion_tokens, error) = match result {
-                        Ok((ttft, tokens)) => (Some(ttft), Some(tokens), None),
-                        Err(error) => (None, None, Some(error)),
+                    let (stats, error) = match result {
+                        Ok(stats) => (Some(stats), None),
+                        Err(error) => (None, Some(error)),
                     };
                     samples.push(Sample {
                         engine: target.endpoint.engine.clone(),
                         concurrency,
                         request,
                         prompt_index,
-                        ttft_ms,
+                        ttft_ms: stats.as_ref().map(|s| s.ttft_ms),
+                        estimated_tpot_ms: stats.as_ref().and_then(|s| s.estimated_tpot_ms),
+                        max_frame_gap_ms: stats.as_ref().and_then(|s| s.max_frame_gap_ms),
+                        text_frames: stats.as_ref().map_or(0, |s| s.text_frames),
                         total_ms: start.elapsed().as_secs_f64() * 1_000.0,
-                        completion_tokens,
+                        completion_tokens: stats.map(|s| s.completion_tokens),
                         error,
                     });
                 }
@@ -217,6 +256,8 @@ fn measure(client: &Client, target: &Target<'_>, config: &Config, concurrency: u
         successes,
         failures: config.requests - successes,
         p95_ttft_ms: percentile95(samples.iter().filter_map(|s| s.ttft_ms).collect()),
+        p95_estimated_tpot_ms: percentile95(samples.iter().filter_map(|s| s.estimated_tpot_ms).collect()),
+        p95_max_frame_gap_ms: percentile95(samples.iter().filter_map(|s| s.max_frame_gap_ms).collect()),
         p95_total_ms: percentile95(samples.iter().filter(|s| s.error.is_none()).map(|s| s.total_ms).collect()),
         output_tokens_per_second: rate,
         usd_per_million_output_tokens: rate.map(|rate| target.endpoint.hourly_usd * 1_000_000.0 / 3_600.0 / rate),
@@ -277,7 +318,8 @@ fn demo(output: &Path) -> Result<(), AnyError> {
     ];
     let points = fixtures.into_iter().map(|(engine, concurrency, ttft, rate, cost)| Point {
         engine: engine.into(), version: "fixture".into(), hardware: "fixture".into(), model: "fixture".into(),
-        concurrency, successes: 64, failures: 0, p95_ttft_ms: Some(ttft), p95_total_ms: None,
+        concurrency, successes: 64, failures: 0, p95_ttft_ms: Some(ttft),
+        p95_estimated_tpot_ms: None, p95_max_frame_gap_ms: None, p95_total_ms: None,
         output_tokens_per_second: Some(rate), usd_per_million_output_tokens: Some(cost), pareto: false,
     }).collect();
     report::write(output, points, true, "Illustrative numbers for checking the report format.")
