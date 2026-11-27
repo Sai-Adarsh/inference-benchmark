@@ -1,5 +1,6 @@
 mod manifest;
 mod report;
+mod slo;
 mod sse;
 
 use reqwest::blocking::Client;
@@ -29,6 +30,7 @@ struct Config {
     #[serde(default)]
     warmup_requests: usize,
     endpoints: Vec<Endpoint>,
+    slo: Option<slo::Budget>,
 }
 
 fn default_timeout() -> u64 { 120 }
@@ -62,6 +64,11 @@ pub struct Point {
     output_tokens_per_second: Option<f64>,
     usd_per_million_output_tokens: Option<f64>,
     pareto: bool,
+    slo_met_requests: Option<usize>,
+    slo_output_tokens: Option<u128>,
+    slo_output_tokens_per_second: Option<f64>,
+    usd_per_million_slo_tokens: Option<f64>,
+    slo_pareto: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -77,6 +84,7 @@ struct Sample {
     total_ms: f64,
     completion_tokens: Option<u64>,
     error: Option<String>,
+    slo_met: Option<bool>,
 }
 
 struct Target<'a> {
@@ -173,6 +181,9 @@ fn stream_chat(client: &Client, target: &Target<'_>, prompt: &str, max_tokens: u
     let ttft_ms = first_text_ms.ok_or("No generated text in stream")?;
     let completion_tokens = completion_tokens.filter(|&tokens| tokens > 0)
         .ok_or("Missing positive usage.completion_tokens")?;
+    if u128::from(completion_tokens) > max_tokens as u128 {
+        return Err("Reported completion tokens exceed the request budget".into());
+    }
     let estimated_tpot_ms = if text_frames >= 2 && completion_tokens > 1 {
         last_text_ms.map(|last| (last - ttft_ms) / (completion_tokens - 1) as f64)
     } else {
@@ -229,6 +240,7 @@ fn measure(client: &Client, target: &Target<'_>, config: &Config, concurrency: u
                         total_ms: start.elapsed().as_secs_f64() * 1_000.0,
                         completion_tokens: stats.map(|s| s.completion_tokens),
                         error,
+                        slo_met: None,
                     });
                 }
                 samples
@@ -244,9 +256,23 @@ fn measure(client: &Client, target: &Target<'_>, config: &Config, concurrency: u
     });
     samples.sort_by_key(|sample| sample.request);
 
-    let tokens = samples.iter().filter_map(|sample| sample.completion_tokens).sum::<u64>();
+    let tokens = samples.iter().filter_map(|sample| sample.completion_tokens).map(u128::from).sum::<u128>();
+    let goodput = config.slo.map(|budget| {
+        let mut requests = 0;
+        let mut tokens = 0u128;
+        for sample in &mut samples {
+            let met = budget.met(sample);
+            sample.slo_met = Some(met);
+            if met {
+                requests += 1;
+                tokens += u128::from(sample.completion_tokens.unwrap_or(0));
+            }
+        }
+        (requests, tokens, tokens as f64 / elapsed)
+    });
     let successes = samples.iter().filter(|sample| sample.error.is_none()).count();
     let rate = if tokens > 0 { Some(tokens as f64 / elapsed) } else { None };
+    let cost = |rate: f64| target.endpoint.hourly_usd / 3_600.0 / rate * 1_000_000.0;
     let point = Point {
         engine: target.endpoint.engine.clone(),
         version: target.endpoint.version.clone(),
@@ -260,8 +286,13 @@ fn measure(client: &Client, target: &Target<'_>, config: &Config, concurrency: u
         p95_max_frame_gap_ms: percentile95(samples.iter().filter_map(|s| s.max_frame_gap_ms).collect()),
         p95_total_ms: percentile95(samples.iter().filter(|s| s.error.is_none()).map(|s| s.total_ms).collect()),
         output_tokens_per_second: rate,
-        usd_per_million_output_tokens: rate.map(|rate| target.endpoint.hourly_usd * 1_000_000.0 / 3_600.0 / rate),
+        usd_per_million_output_tokens: rate.map(cost),
         pareto: false,
+        slo_met_requests: goodput.map(|(requests, _, _)| requests),
+        slo_output_tokens: goodput.map(|(_, tokens, _)| tokens),
+        slo_output_tokens_per_second: goodput.map(|(_, _, rate)| rate),
+        usd_per_million_slo_tokens: goodput.and_then(|(_, _, rate)| (rate > 0.0).then(|| cost(rate))),
+        slo_pareto: None,
     };
     Ok((point, samples))
 }
@@ -280,6 +311,9 @@ fn run(config_path: &Path, output: &Path) -> Result<(), AnyError> {
     let config: Config = serde_json::from_reader(fs::File::open(config_path)?)?;
     if !valid_config(&config) {
         return Err("Provide endpoints, nonempty prompts, positive workloads, and concurrency from 1 to min(requests, 512)".into());
+    }
+    if let Some(budget) = config.slo {
+        budget.validate()?;
     }
     let workload = manifest::Workload::from_config(&config)?;
     let client = Client::builder()
@@ -321,6 +355,8 @@ fn demo(output: &Path) -> Result<(), AnyError> {
         concurrency, successes: 64, failures: 0, p95_ttft_ms: Some(ttft),
         p95_estimated_tpot_ms: None, p95_max_frame_gap_ms: None, p95_total_ms: None,
         output_tokens_per_second: Some(rate), usd_per_million_output_tokens: Some(cost), pareto: false,
+        slo_met_requests: None, slo_output_tokens: None, slo_output_tokens_per_second: None,
+        usd_per_million_slo_tokens: None, slo_pareto: None,
     }).collect();
     report::write(output, points, true, "Illustrative numbers for checking the report format.")
 }
