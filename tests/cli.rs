@@ -327,6 +327,31 @@ fn counts_stream_errors_and_excludes_all_failed_points_from_pareto_frontier() {
 }
 
 #[test]
+fn counts_conflicting_stream_usage_as_a_failed_sample() {
+    let (url, worker) = mock(2, |prompt, mut stream| {
+        let second_usage = match prompt.as_str() {
+            "case-0" => USAGE.replace(":3", ":4"),
+            "case-1" => USAGE.to_owned(),
+            _ => panic!("unexpected {prompt}"),
+        };
+        respond(&mut stream, "200 OK", &format!("{TEXT}{USAGE}{second_usage}{DONE}"), "");
+    });
+    let dir = Temp::new();
+    save(&dir.path("input.json"), &config(&url, 2));
+    assert_ok(cli(&dir, &["run", "input.json", "usage"]));
+    worker.join().unwrap();
+
+    let summary = load(dir.path("usage/summary.json"));
+    assert_eq!(summary[0]["failures"], 1);
+    assert_eq!(summary[0]["successes"], 1);
+    let mut reader = csv::Reader::from_path(dir.path("usage/samples.csv")).unwrap();
+    let error_column = reader.headers().unwrap().iter().position(|name| name == "error").unwrap();
+    let samples: Vec<_> = reader.records().map(Result::unwrap).collect();
+    assert_eq!(&samples[0][error_column], "Conflicting usage.completion_tokens");
+    assert_eq!(&samples[1][error_column], "");
+}
+
+#[test]
 fn validates_cli_and_refuses_synthetic_or_incompatible_inputs() {
     let dir = Temp::new();
     assert_error(cli(&dir, &[]), "usage");
