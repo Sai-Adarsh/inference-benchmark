@@ -47,7 +47,7 @@ warmups, incomplete responses, and rejection of altered or incompatible
 comparison inputs. It needs no model server or API key.
 
 To rebuild and measure production coverage, install the Rust `llvm-tools-preview`
-component. Set `llvm` to the directory with its `llvm-profdata` and `llvm-cov`
+component and make `jq` available on your PATH. Set `llvm` to the directory with its `llvm-profdata` and `llvm-cov`
 executables, or use a compatible system LLVM.
 
 ```sh
