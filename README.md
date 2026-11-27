@@ -38,3 +38,29 @@ Keep each summary next to its manifest. `compare` requires matching prompt order
 The load generator uses fixed concurrency with no imposed arrival rate. Report failed requests and repeat the sweep at least three times for a public comparison.
 
 Engine references: [vLLM serving](https://docs.vllm.ai/en/latest/serving/online_serving/openai_compatible_server/), [SGLang OpenAI APIs](https://docs.sglang.io/docs/basic_usage/openai_api_completions), and [TensorRT-LLM serving](https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve/trtllm-serve.html).
+
+## Tests
+
+`cargo test --locked` uses loopback HTTP servers and temporary output directories.
+The suite checks request framing and concurrency, SSE text and usage, failed
+warmups, incomplete responses, and rejection of altered or incompatible
+comparison inputs. It needs no model server or API key.
+
+To rebuild and measure production coverage, install the Rust `llvm-tools-preview`
+component. Set `llvm` to the directory with its `llvm-profdata` and `llvm-cov`
+executables, or use a compatible system LLVM.
+
+```sh
+set -eu
+run="$(mktemp -d)"
+mkdir "$run/profiles"
+export CARGO_TARGET_DIR="$run/target"
+export RUSTFLAGS="-C instrument-coverage"
+export LLVM_PROFILE_FILE="$run/profiles/%p-%m.profraw"
+cargo test --locked --message-format=json > "$run/cargo.json"
+sse_test="$(jq -Rr 'fromjson? | select(.reason == "compiler-artifact"
+   and .target.kind == ["test"] and .target.name == "sse") | .executable' "$run/cargo.json")"
+"$llvm/llvm-profdata" merge -sparse "$run"/profiles/*.profraw -o "$run/run.profdata"
+"$llvm/llvm-cov" report "$CARGO_TARGET_DIR/debug/inference-benchmark" \
+  -object "$sse_test" -instr-profile "$run/run.profdata" "$PWD/src"
+```
