@@ -7,7 +7,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const FILE_NAME: &str = "run.json";
 
 #[derive(Deserialize, PartialEq, Serialize)]

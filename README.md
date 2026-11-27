@@ -28,7 +28,9 @@ Keep each summary next to its manifest. `compare` requires matching prompt order
 
 ## Metrics
 
-- **TTFT** is the time from sending the request to the first stream frame with generated or reasoning text. A successful response reports `usage.completion_tokens` and ends with `[DONE]`.
+- **TTFT** is the time from sending the request to the first complete event with generated or reasoning text. The client supports SSE comments, CRLF, and multiline data. A successful response reports `usage.completion_tokens` and ends with a complete `[DONE]` event. Lines and event data are capped at 1 MiB.
+- **Estimated TPOT** divides the time between the first and last text events by completion tokens minus one. It requires at least two text events and two completion tokens. Frames may contain several tokens, so this is a client estimate of time per output token.
+- **Max frame gap** is the longest interval between adjacent events with text in one request. The summary reports the p95 of that per-request value. It measures delivery stalls, including buffering outside the model process.
 - **Throughput** is successful output tokens divided by the batch's wall time.
 - **Cost per million output tokens** is total hourly deployment cost divided by millions of output tokens per hour.
 - **Pareto frontier** includes fully successful points for which no other fully successful point is at least as good on all three objectives and better on at least one. The objectives are lower p95 TTFT, higher throughput, and lower cost.
