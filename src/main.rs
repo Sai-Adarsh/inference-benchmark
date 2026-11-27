@@ -172,6 +172,9 @@ fn stream_chat(client: &Client, target: &Target<'_>, prompt: &str, max_tokens: u
             text_frames += 1;
         }
         if let Some(tokens) = event["usage"]["completion_tokens"].as_u64() {
+            if completion_tokens.is_some_and(|reported| reported != tokens) {
+                return Err("Conflicting usage.completion_tokens".into());
+            }
             completion_tokens = Some(tokens);
         }
     }
