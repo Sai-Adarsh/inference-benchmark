@@ -53,9 +53,16 @@ fn plot(path: &Path, points: &[Point], demo: bool, objective: Objective) -> Resu
         ),
     };
     let root = root.titled(heading, ("sans-serif", 28))?;
-    let mut engines: Vec<_> = points.iter().map(|(p, _)| &p.engine).collect();
-    engines.sort();
-    engines.dedup();
+    let identity = |point: &Point| {
+        if demo {
+            point.engine.clone()
+        } else {
+            format!("{} {} ({})", point.engine, point.version, point.hardware)
+        }
+    };
+    let mut series_names: Vec<_> = points.iter().map(|(point, _)| identity(point)).collect();
+    series_names.sort();
+    series_names.dedup();
     let palettes = [BLUE, RED, GREEN, MAGENTA, CYAN, BLACK];
     let xmax = points.iter().map(|(_, (_, rate, _))| *rate).fold(1.0, f64::max) * 1.16;
     for (index, pane) in root.split_evenly((1, 2)).into_iter().enumerate() {
@@ -65,18 +72,18 @@ fn plot(path: &Path, points: &[Point], demo: bool, objective: Objective) -> Resu
         let mut chart = ChartBuilder::on(&pane).margin(22).x_label_area_size(45).y_label_area_size(65)
             .build_cartesian_2d(0.0..xmax, 0.0..ymax)?;
         chart.configure_mesh().x_desc(throughput_axis).y_desc(axis).draw()?;
-        for (number, engine) in engines.iter().enumerate() {
+        for (number, name) in series_names.iter().enumerate() {
             let color = palettes[number % palettes.len()];
-            let series = points.iter().filter(|(point, _)| &point.engine == *engine);
+            let series = points.iter().filter(|(point, _)| &identity(point) == name);
             chart.draw_series(series.map(|(point, (ttft, rate, cost))| {
                 let at = (*rate, y(*ttft, *cost));
                 let mark = if objective.is_frontier(point) { color.filled() } else { color.stroke_width(2) };
                 EmptyElement::at(at) + Circle::new((0, 0), 5, mark) +
                     Text::new(point.concurrency.to_string(), (7, -7), ("sans-serif", 12))
-            }))?.label(engine.as_str())
+            }))?.label(name.as_str())
                 .legend(move |(x, y)| Circle::new((x + 7, y), 4, color.filled()));
         }
-        if !engines.is_empty() {
+        if !series_names.is_empty() {
             chart.configure_series_labels().position(SeriesLabelPosition::UpperLeft)
                 .background_style(WHITE.mix(0.85)).border_style(BLACK.mix(0.25)).draw()?;
         }
@@ -122,12 +129,13 @@ pub fn write(output: &Path, mut points: Vec<Point>, demo: bool, notes: &str) -> 
         plot(&output.join("slo-pareto.svg"), &points, demo, Objective::Goodput)?;
         markdown.push_str("\n## SLO goodput\n\n![SLO goodput and cost](slo-pareto.svg)\n\n");
         markdown.push_str("Goodput counts tokens from requests that meet every budget. Failed and late requests still contribute to wall time and cost. The axes use p95 TTFT across successful requests and cost per million budget-qualified tokens. Points at zero goodput have no unit cost or frontier position.\n\n");
-        markdown.push_str("| Engine | Concurrent | Requests meeting SLO | Qualified tokens | Qualified tokens/s | USD/M qualified tokens | Pareto |\n");
-        markdown.push_str("|---|---:|---:|---:|---:|---:|---|\n");
+        markdown.push_str("| Engine | Version | Hardware | Concurrent | Requests meeting SLO | Qualified tokens | Qualified tokens/s | USD/M qualified tokens | Pareto |\n");
+        markdown.push_str("|---|---|---|---:|---:|---:|---:|---:|---|\n");
         for point in &points {
             markdown.push_str(&format!(
-                "| {} | {} | {} | {} | {} | {} | {} |\n",
-                escape(&point.engine), point.concurrency, point.slo_met_requests.unwrap_or(0),
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                escape(&point.engine), escape(&point.version), escape(&point.hardware),
+                point.concurrency, point.slo_met_requests.unwrap_or(0),
                 point.slo_output_tokens.unwrap_or(0), label(point.slo_output_tokens_per_second),
                 label(point.usd_per_million_slo_tokens),
                 if point.slo_pareto == Some(true) { "Yes" } else { "—" },

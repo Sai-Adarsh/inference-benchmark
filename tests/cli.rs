@@ -522,7 +522,10 @@ fn slo_goodput_counts_only_proven_budget_compliance() {
     );
     assert!(dir.path("budgeted/slo-pareto.svg").exists());
     let report = fs::read_to_string(dir.path("budgeted/REPORT.md")).unwrap();
-    assert!(report.contains("SLO goodput"));
+    let slo_table = report.split_once("## SLO goodput").unwrap().1;
+    assert!(slo_table.contains(r"vLLM \| loopback | test-1 | CPU"));
+    let plot = fs::read_to_string(dir.path("budgeted/slo-pareto.svg")).unwrap();
+    assert!(plot.contains("test-1 (CPU)"));
 }
 
 #[test]
