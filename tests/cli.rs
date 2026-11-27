@@ -297,6 +297,7 @@ fn samples_join_to_their_live_summary_point() {
         panic!("samples.csv has no {name} column")
     });
     let mut samples_per_point = [0; 4];
+    let mut tokens_per_point = [0; 4];
     for sample in csv.records() {
         let sample = sample.unwrap();
         let point: usize = sample[column("point_index")].parse().unwrap();
@@ -306,8 +307,16 @@ fn samples_join_to_their_live_summary_point() {
         assert_eq!(points[point]["concurrency"], concurrency);
         assert_eq!(points[point]["hardware"], if point < 2 { "CPU" } else { "second host" });
         samples_per_point[point] += 1;
+        tokens_per_point[point] += sample[column("completion_tokens")].parse::<u64>().unwrap();
     }
     assert_eq!(samples_per_point, [2; 4]);
+    for (index, point) in points.iter().enumerate() {
+        let elapsed = point["elapsed_seconds"].as_f64().unwrap();
+        let rate = point["output_tokens_per_second"].as_f64().unwrap();
+        assert!(elapsed > 0.0);
+        assert_eq!(tokens_per_point[index], 6);
+        assert!((elapsed * rate - tokens_per_point[index] as f64).abs() < 1e-9);
+    }
 }
 
 #[test]
