@@ -12,15 +12,19 @@ Open `results/fixture/REPORT.md` or `results/fixture/pareto.svg` to see the repo
 
 ## Collect live measurements
 
-1. Copy `h100.example.json` and set actual hourly costs, engine versions, model IDs, and hardware. Set `api_key_env` for endpoints that require a bearer token.
-2. Serve the same model at the same precision on equivalent, isolated GPUs. If you reuse one GPU, run each engine separately and combine its `summary.json` with `compare`.
-3. Put representative requests in the `prompts` array. Record context length, engine flags, quantization, driver, prefix caching, warmup, and concurrency.
+1. Copy `h100.example.json` and set actual hourly costs, engine versions, model ID, precision, and hardware. Set `model_revision` to the checkpoint revision and `api_key_env` for endpoints that require a bearer token.
+2. Serve the same model at the same precision on equivalent, isolated GPUs. If you reuse one GPU, run each engine separately into its own output directory.
+3. Put representative requests in the `prompts` array. Record context length, engine flags, driver, and prefix caching alongside the results.
 
 ```sh
 cargo run --release -- run h100.json ./results/live
 cargo run --release -- compare ./results/combined \
   ./results/vllm/summary.json ./results/sglang/summary.json ./results/trtllm/summary.json
 ```
+
+Use a new output path for each command. The benchmark creates that directory and refuses to write into an existing one. A completed live run writes `run.json` next to `summary.json`. The manifest records the workload, a SHA-256 digest of the ordered prompts, engine versions, hardware, hourly price, and a checksum of the summary. It omits prompt text, endpoint URLs, and API keys.
+
+Keep each summary next to its manifest. `compare` requires matching prompt order, concurrency sweep, request and warmup counts, token budget, timeout, and model settings. Set `model_revision` and `precision` to compare runs or benchmark multiple endpoints at once. `compare` also rejects missing manifests, duplicate runs, and summaries that fail the checksum. Rerun older summaries to include them in a comparison.
 
 ## Metrics
 

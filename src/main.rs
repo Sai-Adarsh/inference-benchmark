@@ -1,3 +1,4 @@
+mod manifest;
 mod report;
 
 use reqwest::blocking::Client;
@@ -13,6 +14,8 @@ use std::{
 };
 
 type AnyError = Box<dyn std::error::Error>;
+
+const SAMPLING_TEMPERATURE: u8 = 0;
 
 #[derive(Deserialize)]
 struct Config {
@@ -35,6 +38,8 @@ struct Endpoint {
     version: String,
     hardware: String,
     model: String,
+    model_revision: Option<String>,
+    precision: Option<String>,
     base_url: String,
     hourly_usd: f64,
     api_key_env: Option<String>,
@@ -92,7 +97,7 @@ fn stream_chat(client: &Client, target: &Target<'_>, prompt: &str, max_tokens: u
         "model": target.endpoint.model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
-        "temperature": 0,
+        "temperature": SAMPLING_TEMPERATURE,
         "stream": true,
         "stream_options": {"include_usage": true}
     }));
@@ -235,17 +240,20 @@ fn run(config_path: &Path, output: &Path) -> Result<(), AnyError> {
     if !valid_config(&config) {
         return Err("Provide endpoints, nonempty prompts, positive workloads, and concurrency from 1 to min(requests, 512)".into());
     }
+    let workload = manifest::Workload::from_config(&config)?;
     let client = Client::builder()
         .timeout(Duration::from_secs(config.timeout_seconds))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
-    fs::create_dir_all(output)?;
+    let targets = config.endpoints.iter().map(Target::new).collect::<Result<Vec<_>, _>>()?;
+    manifest::prepare_output(output)?;
+    let started = manifest::timestamp()?;
     let mut report = Vec::new();
-    let mut samples_file = csv::Writer::from_path(output.join("samples.csv"))?;
-    for endpoint in &config.endpoints {
-        let target = Target::new(endpoint)?;
+    let samples = fs::OpenOptions::new().write(true).create_new(true).open(output.join("samples.csv"))?;
+    let mut samples_file = csv::Writer::from_writer(samples);
+    for target in &targets {
         for &concurrency in &config.concurrency {
-            let (point, samples) = measure(&client, &target, &config, concurrency)?;
+            let (point, samples) = measure(&client, target, &config, concurrency)?;
             eprintln!("{} @ {} concurrent: {} success, {} failed",
                       point.engine, point.concurrency, point.successes, point.failures);
             for sample in samples {
@@ -255,14 +263,12 @@ fn run(config_path: &Path, output: &Path) -> Result<(), AnyError> {
             report.push(point);
         }
     }
-    let notes = format!(
-        "{} requests per point, {} warmup requests per point, {} prompts, {} max output tokens.",
-        config.requests, config.warmup_requests, config.prompts.len(), config.max_tokens,
-    );
-    report::write(output, report, false, &notes)
+    report::write(output, report, false, &workload.notes())?;
+    manifest::write_run(output, workload, &config.endpoints, started)
 }
 
 fn demo(output: &Path) -> Result<(), AnyError> {
+    manifest::prepare_output(output)?;
     let fixtures = [
         ("vLLM", 1, 39.0, 70.0, 28.0), ("vLLM", 8, 67.0, 290.0, 6.8), ("vLLM", 32, 195.0, 475.0, 4.1),
         ("SGLang", 1, 48.0, 75.0, 26.0), ("SGLang", 8, 70.0, 325.0, 6.0), ("SGLang", 32, 214.0, 490.0, 4.0),
@@ -277,27 +283,14 @@ fn demo(output: &Path) -> Result<(), AnyError> {
     report::write(output, points, true, "Illustrative numbers for checking the report format.")
 }
 
-fn compare(output: &Path, inputs: &[&str]) -> Result<(), AnyError> {
-    let mut points = Vec::new();
-    for input in inputs {
-        let rows: Vec<Point> = serde_json::from_reader(fs::File::open(input)?)?;
-        if rows.iter().any(|point| point.version == "fixture") {
-            return Err("Use the demo command to render synthetic fixture data.".into());
-        }
-        points.extend(rows);
-    }
-    if points.is_empty() {
-        return Err("No measurements to compare.".into());
-    }
-    report::write(output, points, false, "Combined summaries from independent benchmark runs.")
-}
-
 fn main() -> Result<(), AnyError> {
     let args: Vec<_> = env::args().skip(1).collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["run", config, output] => run(Path::new(config), Path::new(output)),
         ["demo", output] => demo(Path::new(output)),
-        ["compare", output, inputs @ ..] if !inputs.is_empty() => compare(Path::new(output), inputs),
+        ["compare", output, inputs @ ..] if !inputs.is_empty() => {
+            manifest::Comparison::load(inputs)?.write(Path::new(output))
+        }
         _ => Err("usage: inference-benchmark demo OUTPUT_DIR | run CONFIG.json OUTPUT_DIR | compare OUTPUT_DIR SUMMARY.json ...".into()),
     }
 }

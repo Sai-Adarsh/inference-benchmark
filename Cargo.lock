@@ -417,6 +417,7 @@ dependencies = [
  "csv",
  "plotters",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
 ]
